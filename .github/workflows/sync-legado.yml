@@ -1,0 +1,248 @@
+# Legado Auto Sync Workflow
+# Daily sync upstream code + releases (including beta), re-upload APKs with mirror links
+
+name: Sync Legado Upstream
+
+on:
+  schedule:
+    # Every day at 3:00 AM UTC (11:00 AM Beijing time)
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+
+env:
+  UPSTREAM_OWNER: LegadoTeam
+  UPSTREAM_REPO: legado
+  MIRROR_1: https://gh.xxooo.cf
+  MIRROR_2: https://gh-proxy.com
+  MIRROR_3: https://boki.moe
+
+jobs:
+  sync-code:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/${{ env.UPSTREAM_OWNER }}/${{ env.UPSTREAM_REPO }}.git || true
+          git fetch upstream
+
+      - name: Sync master branch
+        run: |
+          git checkout master
+          git merge upstream/master --no-edit || git reset --hard upstream/master
+          git push origin master
+
+      - name: Sync other branches (if any)
+        run: |
+          for branch in $(git branch -r | grep upstream/ | grep -v upstream/HEAD | grep -v 'upstream/master' | sed 's|upstream/||' | tr -d ' '); do
+            echo "Syncing branch: $branch"
+            git checkout -B "$branch" "upstream/$branch" || true
+            git push origin "$branch" --force || true
+          done
+
+  sync-releases:
+    needs: sync-code
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Fetch upstream releases
+        id: fetch-releases
+        run: |
+          echo "Fetching releases from upstream..."
+          curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ env.UPSTREAM_OWNER }}/${{ env.UPSTREAM_REPO }}/releases?per_page=30" \
+            > upstream_releases.json
+
+          echo "Fetching own releases..."
+          curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/releases?per_page=100" \
+            > own_releases.json
+
+          # Extract existing release tag names
+          python3 -c "
+          import json
+          with open('own_releases.json') as f:
+              own = json.load(f)
+          tags = [r['tag_name'] for r in own]
+          with open('existing_tags.txt', 'w') as f:
+              f.write('\n'.join(tags))
+          print(f'Existing tags: {len(tags)}')
+          "
+
+          # Count upstream releases
+          python3 -c "
+          import json
+          with open('upstream_releases.json') as f:
+              upstream = json.load(f)
+          print(f'Upstream releases: {len(upstream)}')
+          for r in upstream:
+              print(f'  - {r["tag_name"]} (pre:{r["prerelease"]}) assets:{len(r.get("assets",[]))}')
+          "
+
+      - name: Sync releases with mirrored download links
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 << 'PYEOF'
+          import json, os, subprocess, urllib.request, tempfile
+
+          MIRRORS = [
+              os.environ['MIRROR_1'],
+              os.environ['MIRROR_2'],
+              os.environ['MIRROR_3'],
+          ]
+          REPO = os.environ['GITHUB_REPOSITORY']
+          TOKEN = os.environ['GH_TOKEN']
+
+          with open('existing_tags.txt') as f:
+              existing_tags = set(l.strip() for l in f if l.strip())
+
+          with open('upstream_releases.json') as f:
+              upstream_releases = json.load(f)
+
+          def gh_api(method, url, data=None):
+              """Call GitHub API"""
+              url = f"https://api.github.com{url}"
+              headers = {
+                  'Authorization': f'token {TOKEN}',
+                  'Accept': 'application/vnd.github+json',
+              }
+              if data:
+                  headers['Content-Type'] = 'application/json'
+                  data = json.dumps(data).encode()
+              req = urllib.request.Request(url, data=data, headers=headers, method=method)
+              try:
+                  with urllib.request.urlopen(req) as resp:
+                      return json.loads(resp.read()) if resp.status != 204 else {}
+              except Exception as e:
+                  print(f'API error: {e}')
+                  return None
+
+          def download_file(url, path):
+              """Download file from URL"""
+              req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+              with urllib.request.urlopen(req) as resp:
+                  with open(path, 'wb') as f:
+                      while True:
+                          chunk = resp.read(65536)
+                          if not chunk:
+                              break
+                          f.write(chunk)
+
+          def upload_asset(upload_url, file_path, file_name):
+              """Upload asset to release"""
+              upload_url = upload_url.split('{')[0] + f'?name={file_name}'
+              with open(file_path, 'rb') as f:
+                  import http.client
+                  import urllib.parse
+                  parsed = urllib.parse.urlparse(upload_url)
+                  conn = http.client.HTTPSConnection(parsed.netloc)
+                  conn.request('POST', parsed.path + '?' + parsed.query, body=f.read(),
+                               headers={
+                                   'Authorization': f'token {TOKEN}',
+                                   'Content-Type': 'application/octet-stream',
+                                   'Content-Length': str(os.path.getsize(file_path)),
+                               })
+                  resp = conn.getresponse()
+                  result = json.loads(resp.read())
+                  print(f'  Upload {file_name}: HTTP {resp.status}')
+                  return result
+
+          synced = 0
+          skipped = 0
+
+          for release in upstream_releases:
+              tag = release['tag_name']
+              if tag in existing_tags:
+                  print(f'\n[SKIP] {tag} already exists')
+                  skipped += 1
+                  continue
+
+              assets = release.get('assets', [])
+              if not assets:
+                  print(f'\n[SKIP] {tag} has no assets')
+                  skipped += 1
+                  continue
+
+              print(f'\n[SYNC] {tag} (prerelease={release["prerelease"]})')
+
+              # Build body with mirror links
+              original_body = release.get('body', '') or ''
+              mirror_lines = ['\n\n---\n## 📥 国内镜像下载链接\n']
+              for asset in assets:
+                  orig_url = asset['browser_download_url']
+                  mirror_lines.append(f'### {asset["name"]}\n')
+                  for i, mirror in enumerate(MIRRORS, 1):
+                      mirror_url = f'{mirror}/{orig_url}'
+                      mirror_lines.append(f'- 镜像{i}: [{mirror}]({mirror_url})')
+                  mirror_lines.append('')
+              mirror_body = original_body + '\n'.join(mirror_lines)
+
+              # Create release
+              new_release = gh_api('POST', f'/repos/{REPO}/releases', {
+                  'tag_name': tag,
+                  'target_commitish': release.get('target_commitish', 'master'),
+                  'name': release.get('name', tag),
+                  'body': mirror_body,
+                  'prerelease': release['prerelease'],
+              })
+
+              if not new_release:
+                  print(f'  Failed to create release for {tag}')
+                  continue
+
+              upload_url = new_release['upload_url']
+              print(f'  Created release ID: {new_release["id"]}')
+
+              # Download and upload each asset
+              for asset in assets:
+                  asset_name = asset['name']
+                  asset_url = asset['url']  # API URL for download
+                  print(f'  Downloading {asset_name}...')
+
+                  tmp_path = os.path.join(tempfile.gettempdir(), asset_name)
+                  try:
+                      req = urllib.request.Request(asset_url, headers={
+                          'Authorization': f'token {TOKEN}',
+                          'Accept': 'application/octet-stream',
+                      })
+                      with urllib.request.urlopen(req) as resp:
+                          with open(tmp_path, 'wb') as f:
+                              while True:
+                                  chunk = resp.read(65536)
+                                  if not chunk:
+                                      break
+                                  f.write(chunk)
+                      print(f'    Downloaded: {os.path.getsize(tmp_path)//1024}KB')
+
+                      upload_asset(upload_url, tmp_path, asset_name)
+                  except Exception as e:
+                      print(f'    Error: {e}')
+                  finally:
+                      if os.path.exists(tmp_path):
+                          os.unlink(tmp_path)
+
+              synced += 1
+
+          print(f'\n=== Done: synced={synced}, skipped={skipped} ===')
+          PYEOF
+
+      - name: Sync tags
+        run: |
+          # Fetch all upstream tags and push to origin
+          git fetch --tags upstream || true
+          git push origin --tags --force || true
