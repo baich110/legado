@@ -9,6 +9,10 @@ on:
     - cron: '0 3 * * *'
   workflow_dispatch:
 
+permissions:
+  contents: write
+  actions: write
+
 env:
   UPSTREAM_OWNER: LegadoTeam
   UPSTREAM_REPO: legado
@@ -182,13 +186,13 @@ jobs:
 
               # Build body with mirror links
               original_body = release.get('body', '') or ''
-              mirror_lines = ['\n\n---\n## 📥 国内镜像下载链接\n']
+              mirror_lines = ['\n\n---\n## \U0001f4e5 \u56fd\u5185\u955c\u50cf\u4e0b\u8f7d\u94fe\u63a5\n']
               for asset in assets:
                   orig_url = asset['browser_download_url']
                   mirror_lines.append(f'### {asset["name"]}\n')
                   for i, mirror in enumerate(MIRRORS, 1):
                       mirror_url = f'{mirror}/{orig_url}'
-                      mirror_lines.append(f'- 镜像{i}: [{mirror}]({mirror_url})')
+                      mirror_lines.append(f'- \u955c\u50cf{i}: [{mirror}]({mirror_url})')
                   mirror_lines.append('')
               mirror_body = original_body + '\n'.join(mirror_lines)
 
